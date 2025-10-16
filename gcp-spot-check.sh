@@ -10,7 +10,7 @@ GCPSC_SCRIPT="$INSTALL_PATH/gcpsc"
 CONFIG_DIR="/etc/gcpsc"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LASTCHECK_DIR="$CONFIG_DIR/lastcheck"
-SCRIPT_URL="https://raw.githubusercontent.com/crazy0x70/scripts/refs/heads/main/gcp-spot-check/gcp-spot-check.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/crazy0x70/GCP-Spot-Check/refs/heads/main/gcp-spot-check.sh"
 
 if [ -w "/var/log" ]; then
     LOG_FILE="/var/log/gcpsc.log"
