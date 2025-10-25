@@ -10,7 +10,7 @@ GCPSC_SCRIPT="$INSTALL_PATH/gcpsc"
 CONFIG_DIR="/etc/gcpsc"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LASTCHECK_DIR="$CONFIG_DIR/lastcheck"
-SCRIPT_URL="https://raw.githubusercontent.com/crazy0x70/GCP-Spot-Check/refs/heads/main/gcp-spot-check.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/crazy0x70/scripts/refs/heads/main/gcp-spot-check/gcp-spot-check.sh"
 
 if [ -w "/var/log" ]; then
     LOG_FILE="/var/log/gcpsc.log"
@@ -269,12 +269,27 @@ ensure_instance_entry() {
 refresh_account_inventory() {
     local account="$1"
 
+    local projects_output
+    if ! projects_output=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>&1); then
+        local first_line
+        first_line=$(printf '%s\n' "$projects_output" | head -n1)
+        log WARN "账号 $account 无法实时获取项目列表: ${first_line:-未知错误}"
+        projects_output=""
+    fi
+
     local projects
-    projects=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>/dev/null || true)
+    projects=$(printf '%s\n' "$projects_output" | sed '/^[[:space:]]*$/d')
 
     if [ -z "$projects" ]; then
-        log WARN "账号 $account 未获取到有效项目，跳过资源刷新"
-        return 0
+        local cached_projects
+        cached_projects=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc) | .projects[]?.id' "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$cached_projects" ]; then
+            projects="$cached_projects"
+            log INFO "账号 $account 使用已保存的项目列表进行刷新"
+        else
+            log WARN "账号 $account 未获取到有效项目，跳过资源刷新"
+            return 0
+        fi
     fi
 
     while IFS= read -r project_id; do
@@ -503,6 +518,47 @@ activate_account() {
     return 0
 }
 
+get_instance_status() {
+    local account="$1"
+    local project="$2"
+    local zone="$3"
+    local instance="$4"
+
+    local status_output
+    if ! status_output=$(gcloud compute instances describe "$instance" \
+        --zone="$zone" --project="$project" --account="$account" \
+        --format='value(status)' 2>&1); then
+        local first_line
+        first_line=$(printf '%s\n' "$status_output" | head -n1)
+        log WARN "[$account/$project/$zone/$instance] 获取状态失败: ${first_line:-未知错误}"
+        echo "UNKNOWN"
+        return 1
+    fi
+
+    if [ -z "$status_output" ]; then
+        echo "UNKNOWN"
+        return 1
+    fi
+
+    echo "$status_output"
+    return 0
+}
+
+should_attempt_start() {
+    local status="$1"
+    case "$status" in
+        RUNNING|PROVISIONING|STAGING|REPAIRING)
+            return 1
+            ;;
+        STOPPED|TERMINATED|STOPPING|SUSPENDED|SUSPENDING|DEPROVISIONED|PREEMPTED|ERROR|UNKNOWN|"")
+            return 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 check_single_instance() {
     local account=$1
     local project=$2
@@ -514,16 +570,17 @@ check_single_instance() {
         return 1
     fi
     
-    local status=$(gcloud compute instances describe "$instance" \
-        --zone="$zone" --project="$project" --account="$account" \
-        --format='get(status)' 2>/dev/null || echo "ERROR")
+    local status
+    status=$(get_instance_status "$account" "$project" "$zone" "$instance")
+    local status_rc=$?
     
     log INFO "[$account/$project/$zone/$instance] 状态: $status"
     
-    if [ "$status" != "RUNNING" ] && [ "$status" != "ERROR" ]; then
+    if should_attempt_start "$status"; then
         log WARN "[$account/$project/$zone/$instance] 不在运行状态，正在启动..."
-        if gcloud compute instances start "$instance" \
-            --zone="$zone" --project="$project" --account="$account" --quiet 2>/dev/null; then
+        local start_output
+        if start_output=$(gcloud compute instances start "$instance" \
+            --zone="$zone" --project="$project" --account="$account" --quiet 2>&1); then
             log INFO "[$account/$project/$zone/$instance] 启动命令已发送"
             
             echo "等待实例启动..."
@@ -533,7 +590,7 @@ check_single_instance() {
                 sleep 2
                 local new_status=$(gcloud compute instances describe "$instance" \
                     --zone="$zone" --project="$project" --account="$account" \
-                    --format='get(status)' 2>/dev/null || echo "ERROR")
+                    --format='value(status)' 2>/dev/null || echo "UNKNOWN")
                 if [ "$new_status" = "RUNNING" ]; then
                     log INFO "[$account/$project/$zone/$instance] 实例已成功启动"
                     break
@@ -541,10 +598,14 @@ check_single_instance() {
                 waited=$((waited + 2))
             done
         else
-            log ERROR "[$account/$project/$zone/$instance] 启动失败"
+            local first_line
+            first_line=$(printf '%s\n' "$start_output" | head -n1)
+            log ERROR "[$account/$project/$zone/$instance] 启动失败: ${first_line:-未知错误}"
         fi
     elif [ "$status" = "RUNNING" ]; then
         echo "实例状态正常：RUNNING"
+    elif [ "$status_rc" -ne 0 ]; then
+        log WARN "[$account/$project/$zone/$instance] 状态未知，暂未尝试启动"
     fi
     
     local lastcheck_file="$LASTCHECK_DIR/${account//[@.]/_}_${project}_${zone}_${instance}"
@@ -787,50 +848,74 @@ delete_account_menu() {
 }
 
 show_accounts_menu() {
-    local accounts=$(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
-    
-    if [ -z "$accounts" ]; then
-        echo "还没有添加任何账号，请先添加账号"
-        add_account
-        return
-    fi
-    echo
-    echo "===== 已添加的账号 ====="
-    
-    local i=1
-    while IFS= read -r acc; do
-        local count=$(jq -r --arg acc "$acc" \
-            '[.accounts[] | select(.account == $acc) | .projects[].zones[].instances[]] | length' \
-            "$CONFIG_FILE" 2>/dev/null)
-        echo "$i) $acc (监控 $count 个实例)"
-        i=$((i+1))
-    done <<< "$accounts"
-    
-    echo
-    echo "a) 添加新账号"
-    echo "d) 删除账号"
-    echo "0) 返回主菜单"
-    
-    read -p "请选择 [数字/a/d/0]: " choice
-    
-    if [ "$choice" = "0" ]; then
-        return 0
-    elif [ "$choice" = "a" ]; then
-        add_account
-        show_accounts_menu
-    elif [ "$choice" = "d" ] || [ "$choice" = "D" ]; then
-        delete_account_menu
-        show_accounts_menu
-    elif [[ "$choice" =~ ^[0-9]+$ ]]; then
-        local selected_account=$(echo "$accounts" | sed -n "${choice}p")
-        if [ -n "$selected_account" ]; then
-            show_account_instances "$selected_account"
-        else
-            echo "无效选择"
+    while true; do
+        local accounts_array=()
+        mapfile -t accounts_array < <(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
+
+        if [ "${#accounts_array[@]}" -eq 0 ]; then
+            echo
+            echo "当前尚未添加账号，请先完成配置"
+            echo "1) 添加新账号"
+            echo "0) 返回主菜单"
+            read -p "请选择 [0-1]: " empty_choice
+            case "$empty_choice" in
+                1)
+                    add_account
+                    continue
+                    ;;
+                0)
+                    return 0
+                    ;;
+                *)
+                    echo "无效输入"
+                    continue
+                    ;;
+            esac
         fi
-    else
-        echo "无效输入"
-    fi
+
+        echo
+        echo "===== 已添加的账号 ====="
+
+        local idx=1
+        for acc in "${accounts_array[@]}"; do
+            local count
+            count=$(jq -r --arg acc "$acc" \
+                '[.accounts[] | select(.account == $acc) | .projects[].zones[].instances[]] | length' \
+                "$CONFIG_FILE" 2>/dev/null)
+            [ -z "$count" ] && count=0
+            echo "$idx) $acc (监控 $count 个实例)"
+            idx=$((idx + 1))
+        done
+
+        local add_option=$idx
+        local delete_option=$((idx + 1))
+
+        echo
+        echo "$add_option) 添加新账号"
+        echo "$delete_option) 删除账号"
+        echo "0) 返回主菜单"
+
+        read -p "请选择 [0-$delete_option]: " choice
+
+        if [ "$choice" = "0" ]; then
+            return 0
+        elif [ "$choice" = "$add_option" ]; then
+            add_account
+            continue
+        elif [ "$choice" = "$delete_option" ]; then
+            delete_account_menu
+            continue
+        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+            local selected_index=$((choice - 1))
+            if [ "$selected_index" -ge 0 ] && [ "$selected_index" -lt "${#accounts_array[@]}" ]; then
+                show_account_instances "${accounts_array[$selected_index]}"
+            else
+                echo "无效选择"
+            fi
+        else
+            echo "无效输入"
+        fi
+    done
 }
 
 show_account_instances() {
@@ -1101,36 +1186,23 @@ check_all_instances() {
             fi
 
             local status
-            status=$(gcloud compute instances describe "$instance" \
-                --zone="$zone" --project="$project" --account="$account" \
-                --format='get(status)' 2>/dev/null || echo "ERROR")
-
+            status=$(get_instance_status "$account" "$project" "$zone" "$instance")
+            local status_rc=$?
             log INFO "[$account/$project/$zone/$instance] 状态: $status"
 
             local lastcheck_file="$LASTCHECK_DIR/${account//[@.]/_}_${project}_${zone}_${instance}"
             echo "$(date +%s)" > "$lastcheck_file" 2>/dev/null || true
 
-            local should_start=0
-            case "$status" in
-                RUNNING|PROVISIONING|STAGING|REPAIRING)
-                    ;;
-                STOPPED|TERMINATED|STOPPING|SUSPENDED|SUSPENDING|DEPROVISIONED|PREEMPTED)
-                    should_start=1
-                    ;;
-                *)
-                    log INFO "[$account/$project/$zone/$instance] 状态 $status 暂不需要操作"
-                    ;;
-            esac
-
-            if [ "$should_start" -eq 1 ]; then
+            if should_attempt_start "$status"; then
                 if [ "$starts_in_cycle" -ge "$MAX_PARALLEL_STARTS" ]; then
                     log WARN "[$account/$project/$zone/$instance] 已达到当前巡检启动上限 $MAX_PARALLEL_STARTS，跳过本次启动"
                     continue
                 fi
 
                 log WARN "[$account/$project/$zone/$instance] 检测到实例停止，正在尝试启动..."
-                if gcloud compute instances start "$instance" \
-                    --zone="$zone" --project="$project" --account="$account" --quiet >/dev/null 2>&1; then
+                local start_output
+                if start_output=$(gcloud compute instances start "$instance" \
+                    --zone="$zone" --project="$project" --account="$account" --quiet 2>&1); then
                     starts_in_cycle=$((starts_in_cycle + 1))
                     log INFO "[$account/$project/$zone/$instance] 启动命令已下发，验证状态..."
 
@@ -1141,7 +1213,7 @@ check_all_instances() {
                         local new_status
                         new_status=$(gcloud compute instances describe "$instance" \
                             --zone="$zone" --project="$project" --account="$account" \
-                            --format='get(status)' 2>/dev/null || echo "UNKNOWN")
+                            --format='value(status)' 2>/dev/null || echo "UNKNOWN")
                         if [ "$new_status" = "RUNNING" ]; then
                             log INFO "[$account/$project/$zone/$instance] 已恢复至 RUNNING"
                             break
@@ -1149,7 +1221,15 @@ check_all_instances() {
                         waited=$((waited + 5))
                     done
                 else
-                    log ERROR "[$account/$project/$zone/$instance] 启动失败，请检查权限或配额"
+                    local first_line
+                    first_line=$(printf '%s\n' "$start_output" | head -n1)
+                    log ERROR "[$account/$project/$zone/$instance] 启动失败，请检查权限或配额: ${first_line:-未知错误}"
+                fi
+            else
+                if [ "$status" != "RUNNING" ] && [ "$status_rc" -ne 0 ]; then
+                    log WARN "[$account/$project/$zone/$instance] 状态未知，暂不执行启动操作"
+                elif [ "$status" != "RUNNING" ]; then
+                    log INFO "[$account/$project/$zone/$instance] 状态 $status 暂不需要操作"
                 fi
             fi
         done <<< "$instances_list"
