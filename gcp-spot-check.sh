@@ -1,15 +1,16 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -uo pipefail
 
-VERSION="1.2.0"
-VERSION_DATE="2025-10-16"
+VERSION="2.0.0"
+VERSION_DATE="2025-02-17"
 
 INSTALL_PATH="/usr/local/bin"
 GCPSC_SCRIPT="$INSTALL_PATH/gcpsc"
 CONFIG_DIR="/etc/gcpsc"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 LASTCHECK_DIR="$CONFIG_DIR/lastcheck"
+KEY_DIR="$CONFIG_DIR/keys"
 SCRIPT_URL="https://raw.githubusercontent.com/crazy0x70/scripts/refs/heads/main/gcp-spot-check/gcp-spot-check.sh"
 
 if [ -w "/var/log" ]; then
@@ -27,25 +28,42 @@ LOGO="
 ========================================================
 "
 
-if [ -n "$SUDO_USER" ] && [ "$HOME" = "/root" ]; then
+if [ -n "${SUDO_USER:-}" ] && [ "${HOME:-}" = "/root" ]; then
     ORIGINAL_USER_HOME=$(eval echo "~$SUDO_USER" 2>/dev/null)
     ORIGINAL_USER_HOME=${ORIGINAL_USER_HOME:-$HOME}
 else
-    ORIGINAL_USER_HOME="$HOME"
+    ORIGINAL_USER_HOME="${HOME:-/root}"
 fi
 
+DEFAULT_INTERVAL_MIN=10
 MAX_PARALLEL_STARTS=5
+START_RETRY=3
+WAIT_SECONDS_FOR_RUNNING=90
+STATUS_POLL_INTERVAL=5
+
+log() {
+    local level="$1"; shift
+    local msg="$*"
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")] [$level] $msg" | tee -a "$LOG_FILE"
+}
+
+fatal() {
+    log ERROR "$*"
+    exit 1
+}
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "请使用 root 或 sudo 运行此脚本"
+        exit 1
+    fi
+}
 
 expand_user_path() {
     local input="$1"
-    if [ -z "$input" ]; then
-        echo ""
-        return 1
-    fi
-
     case "$input" in
         "~") echo "$ORIGINAL_USER_HOME" ;;
-        "~/"*) echo "$ORIGINAL_USER_HOME/${input:2}" ;;
+        "~/*") echo "$ORIGINAL_USER_HOME/${input:2}" ;;
         *) echo "$input" ;;
     esac
 }
@@ -54,324 +72,56 @@ sanitize_account_key_filename() {
     echo "$1" | tr -c 'A-Za-z0-9._-' '_'
 }
 
-store_service_account_key() {
-    local account_email="$1"
-    local source_path="$2"
-    local dest_dir="$CONFIG_DIR/keys"
-    local sanitized
-    sanitized=$(sanitize_account_key_filename "$account_email")
-    local dest_path="$dest_dir/${sanitized}.json"
-
-    mkdir -p "$dest_dir"
-    chmod 700 "$dest_dir" 2>/dev/null || true
-
-    if [ "$source_path" != "$dest_path" ]; then
-        cp "$source_path" "$dest_path" || return 1
-    fi
-
-    chmod 600 "$dest_path"
-    echo "$dest_path"
-}
-
-persist_account_entry() {
-    local account="$1"
-    local type="$2"
-    local key_file="$3"
-
-    if jq -e --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE" >/dev/null 2>&1; then
-        if [ "$type" = "service" ]; then
-            jq --arg acc "$account" --arg file "$key_file" '
-                .accounts = (.accounts | map(
-                    if .account == $acc then
-                        (.projects = (.projects // []))
-                        | (.type = "service")
-                        | (.key_file = $file)
-                    else .
-                    end
-                ))
-            ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        else
-            jq --arg acc "$account" '
-                .accounts = (.accounts | map(
-                    if .account == $acc then
-                        (.projects = (.projects // []))
-                        | (.type = "user")
-                        | (if has("key_file") then del(.key_file) else . end)
-                    else .
-                    end
-                ))
-            ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        fi
-    else
-        if [ "$type" = "service" ]; then
-            jq --arg acc "$account" --arg file "$key_file" '
-                .accounts += [{"account": $acc, "type": "service", "key_file": $file, "projects": []}]
-            ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        else
-            jq --arg acc "$account" '
-                .accounts += [{"account": $acc, "type": "user", "projects": []}]
-            ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        fi
-    fi
-}
-
-cleanup_lastcheck_files() {
-    local account="$1"
-    local sanitized="${account//[@.]/_}_"
-    rm -f "$LASTCHECK_DIR"/"${sanitized}"* 2>/dev/null || true
-}
-
-remove_account_entry() {
-    local account="$1"
-    local acc_info
-    acc_info=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE")
-
-    if [ -z "$acc_info" ] || [ "$acc_info" = "null" ]; then
-        echo "账号 $account 不存在"
-        return 1
-    fi
-
-    local key_file
-    key_file=$(echo "$acc_info" | jq -r '.key_file // ""')
-
-    jq --arg acc "$account" '
-        .accounts = (.accounts | map(select(.account != $acc)))
-    ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-
-    if [ -n "$key_file" ] && [[ "$key_file" == "$CONFIG_DIR/keys/"* ]]; then
-        rm -f "$key_file"
-    fi
-
-    cleanup_lastcheck_files "$account"
-    gcloud auth revoke "$account" >/dev/null 2>&1 || true
-    log INFO "已删除账号: $account"
-    return 0
-}
-
-ensure_project_entry() {
-    local account="$1"
-    local project="$2"
-
-    local exists
-    exists=$(jq -r --arg acc "$account" --arg proj "$project" '
-        .accounts[] | select(.account == $acc) | .projects[]? | select(.id == $proj) | .id
-    ' "$CONFIG_FILE" 2>/dev/null)
-
-    if [ -z "$exists" ]; then
-        jq --arg acc "$account" --arg proj "$project" '
-            .accounts = (.accounts | map(
-                if .account == $acc then
-                    .projects = ((.projects // []) + [{ "id": $proj, "zones": [] }])
-                else .
-                end
-            ))
-        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        log INFO "为账号 $account 添加项目记录: $project"
-    fi
-}
-
-ensure_zone_entry() {
-    local account="$1"
-    local project="$2"
-    local zone="$3"
-
-    local exists
-    exists=$(jq -r --arg acc "$account" --arg proj "$project" --arg z "$zone" '
-        .accounts[] | select(.account == $acc) |
-        .projects[]? | select(.id == $proj) |
-        .zones[]? | select(.name == $z) | .name
-    ' "$CONFIG_FILE" 2>/dev/null)
-
-    if [ -z "$exists" ]; then
-        jq --arg acc "$account" --arg proj "$project" --arg z "$zone" '
-            .accounts = (.accounts | map(
-                if .account == $acc then
-                    .projects = (.projects | map(
-                        if .id == $proj then
-                            .zones = ((.zones // []) + [{ "name": $z, "instances": [] }])
-                        else .
-                        end
-                    ))
-                else .
-                end
-            ))
-        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        log INFO "为账号 $account/$project 添加区域记录: $zone"
-    fi
-}
-
-ensure_instance_entry() {
-    local account="$1"
-    local project="$2"
-    local zone="$3"
-    local instance="$4"
-    local interval="${5:-10}"
-    local monitor_flag="${6:-true}"
-
-    local exists
-    exists=$(jq -r --arg acc "$account" --arg proj "$project" --arg z "$zone" --arg inst "$instance" '
-        .accounts[] | select(.account == $acc) |
-        .projects[]? | select(.id == $proj) |
-        .zones[]? | select(.name == $z) |
-        .instances[]? | select(.name == $inst) | .name
-    ' "$CONFIG_FILE" 2>/dev/null)
-
-    if [ -z "$exists" ]; then
-        jq --arg acc "$account" --arg proj "$project" --arg z "$zone" --arg inst "$instance" \
-            --argjson int "$interval" --argjson mon "$monitor_flag" '
-            .accounts = (.accounts | map(
-                if .account == $acc then
-                    .projects = (.projects | map(
-                        if .id == $proj then
-                            .zones = (.zones | map(
-                                if .name == $z then
-                                    .instances = ((.instances // []) + [{ "name": $inst, "interval": $int, "monitor": $mon }])
-                                else .
-                                end
-                            ))
-                        else .
-                        end
-                    ))
-                else .
-                end
-            ))
-        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        log INFO "导入实例记录: $account/$project/$zone/$instance (默认开启监控)"
-    else
-        jq --arg acc "$account" --arg proj "$project" --arg z "$zone" --arg inst "$instance" '
-            .accounts = (.accounts | map(
-                if .account == $acc then
-                    .projects = (.projects | map(
-                        if .id == $proj then
-                            .zones = (.zones | map(
-                                if .name == $z then
-                                    .instances = (.instances | map(
-                                        if .name == $inst then
-                                            if has("monitor") then .
-                                            else . + { "monitor": true }
-                                            end
-                                        else .
-                                        end
-                                    ))
-                                else .
-                                end
-                            ))
-                        else .
-                        end
-                    ))
-                else .
-                end
-            ))
-        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-    fi
-}
-
-refresh_account_inventory() {
-    local account="$1"
-
-    local projects_output
-    if ! projects_output=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>&1); then
-        local first_line
-        first_line=$(printf '%s\n' "$projects_output" | head -n1)
-        log WARN "账号 $account 无法实时获取项目列表: ${first_line:-未知错误}"
-        projects_output=""
-    fi
-
-    local projects
-    projects=$(printf '%s\n' "$projects_output" | sed '/^[[:space:]]*$/d')
-
-    if [ -z "$projects" ]; then
-        local cached_projects
-        cached_projects=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc) | .projects[]?.id' "$CONFIG_FILE" 2>/dev/null)
-        if [ -n "$cached_projects" ]; then
-            projects="$cached_projects"
-            log INFO "账号 $account 使用已保存的项目列表进行刷新"
-        else
-            log WARN "账号 $account 未获取到有效项目，跳过资源刷新"
-            return 0
-        fi
-    fi
-
-    while IFS= read -r project_id; do
-        [ -z "$project_id" ] && continue
-        ensure_project_entry "$account" "$project_id"
-
-        local instances_json
-        instances_json=$(gcloud compute instances list --project="$project_id" --account="$account" --format="json(name,zone)" 2>/dev/null || echo "[]")
-
-        if [ -z "$instances_json" ] || [ "$instances_json" = "[]" ]; then
-            continue
-        fi
-
-        while IFS=$'\t' read -r instance_name zone_path; do
-            [ -z "$instance_name" ] && continue
-            local zone="${zone_path##*/}"
-            ensure_zone_entry "$account" "$project_id" "$zone"
-            ensure_instance_entry "$account" "$project_id" "$zone" "$instance_name" 10 true
-        done < <(echo "$instances_json" | jq -r '.[] | select(.name and .zone) | "\(.name)\t\(.zone)"')
-    done <<< "$projects"
-}
-
-check_root() {
-    if [ "$(id -u)" -ne 0 ]; then
-        echo "请使用 root 或 sudo 运行此脚本！"
-        exit 1
-    fi
-}
-
-log() {
-    local level=$1
-    shift
-    local msg="$@"
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")] [$level] $msg" | tee -a "$LOG_FILE"
-}
-
-init_dirs() {
-    mkdir -p "$CONFIG_DIR" "$LASTCHECK_DIR"
+ensure_dirs() {
+    mkdir -p "$CONFIG_DIR" "$LASTCHECK_DIR" "$KEY_DIR"
     touch "$LOG_FILE"
-    [ -f "$CONFIG_FILE" ] || echo '{"version":"'$VERSION'","accounts":[]}' > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE"
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo '{"version":"'$VERSION'","accounts":[]}' > "$CONFIG_FILE"
+    fi
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+config_jq() {
+    local filter="$1"; shift
+    tmp="${CONFIG_FILE}.tmp"
+    jq "$filter" "$CONFIG_FILE" "$@" > "$tmp" && mv "$tmp" "$CONFIG_FILE"
 }
 
 ensure_jq() {
-    if ! command -v jq >/dev/null 2>&1; then
-        log INFO "正在安装 jq..."
-        if [ -f /etc/debian_version ]; then
-            apt-get update && apt-get install -y jq
-        elif [ -f /etc/redhat-release ]; then
-            yum install -y epel-release
-            yum install -y jq
-        else
-            log ERROR "无法自动安装 jq，请手动安装"
-            exit 1
-        fi
+    if command -v jq >/dev/null 2>&1; then
+        return
+    fi
+    log INFO "正在安装 jq..."
+    if [ -f /etc/debian_version ]; then
+        apt-get update && apt-get install -y jq
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y epel-release jq
+    else
+        fatal "无法自动安装 jq，请手动安装 jq 后重试"
     fi
 }
 
 ensure_gcloud() {
     if command -v gcloud >/dev/null 2>&1; then
-        return 0
+        return
     fi
-    
     log INFO "正在安装 Google Cloud SDK..."
-    
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         SYS="$ID"
     else
         SYS="unknown"
     fi
-    
     case "$SYS" in
         ubuntu|debian)
             apt-get update
             apt-get install -y apt-transport-https ca-certificates gnupg curl
             echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee /etc/apt/sources.list.d/google-cloud-sdk.list
-            curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
             apt-get update && apt-get install -y google-cloud-sdk
             ;;
         centos|rhel|rocky|almalinux|fedora)
-            cat > /etc/yum.repos.d/google-cloud-sdk.repo <<EOF
+            cat > /etc/yum.repos.d/google-cloud-sdk.repo <<EOFYUM
 [google-cloud-sdk]
 name=Google Cloud SDK
 baseurl=https://packages.cloud.google.com/yum/repos/cloud-sdk-el8-x86_64
@@ -380,26 +130,20 @@ gpgcheck=1
 repo_gpgcheck=1
 gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
        https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
-EOF
+EOFYUM
             yum install -y google-cloud-sdk
             ;;
         *)
-            log ERROR "不支持的操作系统: $SYS"
-            exit 1
+            fatal "不支持的操作系统，无法自动安装 gcloud"
             ;;
     esac
-    
-    if ! command -v gcloud >/dev/null 2>&1; then
-        log ERROR "gcloud 安装失败"
-        exit 1
-    fi
-    
-    log INFO "Google Cloud SDK 安装成功"
+    command -v gcloud >/dev/null 2>&1 || fatal "gcloud 安装失败"
+    log INFO "Google Cloud SDK 安装完成"
 }
 
 ensure_crontab() {
     if ! command -v crontab >/dev/null 2>&1; then
-        log INFO "正在安装 crontab..."
+        log INFO "正在安装 cron..."
         if [ -f /etc/debian_version ]; then
             apt-get update && apt-get install -y cron
             systemctl enable cron && systemctl start cron
@@ -408,1098 +152,609 @@ ensure_crontab() {
             systemctl enable crond && systemctl start crond
         fi
     fi
-    
     if ! crontab -l 2>/dev/null | grep -q "$GCPSC_SCRIPT check"; then
-        (crontab -l 2>/dev/null ; echo "* * * * * $GCPSC_SCRIPT check >/dev/null 2>&1") | crontab -
-        log INFO "已添加定时任务"
+        (crontab -l 2>/dev/null; echo "* * * * * $GCPSC_SCRIPT check >/dev/null 2>&1") | crontab -
+        log INFO "已添加每分钟巡检定时任务"
     fi
 }
 
-perform_install() {
-    check_root
-    echo "$LOGO"
-    echo "正在安装 GCP Spot Check 服务..."
-    
-    init_dirs
-    
-    ensure_jq
-    ensure_gcloud
-    ensure_crontab
-    
-    log INFO "正在安装 gcpsc 命令..."
-    curl -fsSL "$SCRIPT_URL" -o "$GCPSC_SCRIPT"
-    chmod +x "$GCPSC_SCRIPT"
-    
-    ln -sf "$GCPSC_SCRIPT" /usr/bin/gcpsc
-    
-    log INFO "安装完成！版本: $VERSION"
-    echo
-    echo "========================================="
-    echo "安装成功！"
-    echo "版本: $VERSION"
-    echo "使用命令: sudo gcpsc"
-    echo "日志文件: $LOG_FILE"
-    echo "配置目录: $CONFIG_DIR"
-    echo "========================================="
-    echo
-    echo "现在启动管理界面..."
-    sleep 2
-    exec "$GCPSC_SCRIPT" __installed__
+store_service_account_key() {
+    local account_email="$1"
+    local source_path="$2"
+    local sanitized
+    sanitized=$(sanitize_account_key_filename "$account_email")
+    local dest_path="$KEY_DIR/${sanitized}.json"
+    mkdir -p "$KEY_DIR"
+    cp "$source_path" "$dest_path"
+    chmod 600 "$dest_path" 2>/dev/null || true
+    echo "$dest_path"
 }
 
-perform_uninstall() {
-    check_root
-    echo "$LOGO"
-    echo "正在卸载 GCP Spot Check 服务..."
-    
-    read -p "确认要卸载吗？这将删除所有配置和日志 [y/N]: " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo "已取消卸载"
-        exit 0
+persist_account_entry() {
+    local account="$1"; local type="$2"; local key_file="$3"
+    if jq -e --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE" >/dev/null 2>&1; then
+        if [ "$type" = "service" ]; then
+            config_jq --arg acc "$account" --arg file "$key_file" '
+                .accounts = (.accounts | map(if .account == $acc then . + {"type":"service","key_file":$file} else . end))'
+        else
+            config_jq --arg acc "$account" '
+                .accounts = (.accounts | map(if .account == $acc then (. + {"type":"user"} | del(.key_file)) else . end))'
+        fi
+    else
+        if [ "$type" = "service" ]; then
+            config_jq --arg acc "$account" --arg file "$key_file" '
+                .accounts += [{"account":$acc,"type":"service","key_file":$file,"projects":[]}]'
+        else
+            config_jq --arg acc "$account" '
+                .accounts += [{"account":$acc,"type":"user","projects":[]}]'
+        fi
     fi
-    
-    echo
-    echo "正在清理..."
-    
-    if crontab -l 2>/dev/null | grep -q "$GCPSC_SCRIPT"; then
-        (crontab -l 2>/dev/null | grep -v "$GCPSC_SCRIPT") | crontab -
-        echo "✓ 已删除定时任务"
+}
+
+cleanup_account_artifacts() {
+    local account="$1"
+    local sanitized=${account//@/_}
+    rm -f "$LASTCHECK_DIR/${sanitized}_"* 2>/dev/null || true
+}
+
+remove_account_entry() {
+    local account="$1"
+    local acc_info
+    acc_info=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$acc_info" ] || [ "$acc_info" = "null" ]; then
+        echo "账号不存在"
+        return 1
     fi
-    
-    [ -f "$GCPSC_SCRIPT" ] && rm -f "$GCPSC_SCRIPT" && echo "✓ 已删除主程序"
-    [ -L "/usr/bin/gcpsc" ] && rm -f /usr/bin/gcpsc && echo "✓ 已删除命令链接"
-    
-    [ -d "$CONFIG_DIR" ] && rm -rf "$CONFIG_DIR" && echo "✓ 已删除配置目录"
-    
-    [ -f "$LOG_FILE" ] && rm -f "$LOG_FILE" && echo "✓ 已删除日志文件"
-    
-    echo
-    echo "========================================="
-    echo "卸载完成！"
-    echo "感谢使用 GCP Spot Check 服务"
-    echo "========================================="
+    local key_file
+    key_file=$(echo "$acc_info" | jq -r '.key_file // ""')
+    config_jq --arg acc "$account" '.accounts = (.accounts | map(select(.account != $acc)))'
+    if [ -n "$key_file" ] && [[ "$key_file" == "$KEY_DIR/"* ]]; then
+        rm -f "$key_file" 2>/dev/null || true
+    fi
+    cleanup_account_artifacts "$account"
+    gcloud auth revoke "$account" >/dev/null 2>&1 || true
+    log INFO "已删除账号 $account"
+}
+
+ensure_project_entry() {
+    local account="$1" project="$2"
+    config_jq --arg acc "$account" --arg proj "$project" '
+        .accounts = (.accounts | map(
+            if .account == $acc then
+                if (.projects // [] | map(.id == $proj) | any) then .
+                else . + {projects: ((.projects // []) + [{"id":$proj,"zones":[]}])}
+                end
+            else .
+            end))'
+}
+
+ensure_zone_entry() {
+    local account="$1" project="$2" zone="$3"
+    config_jq --arg acc "$account" --arg proj "$project" --arg z "$zone" '
+        .accounts = (.accounts | map(
+            if .account == $acc then
+                .projects = (.projects // [] | map(
+                    if .id == $proj then
+                        if (.zones // [] | map(.name == $z) | any) then .
+                        else . + {zones: ((.zones // []) + [{"name":$z,"instances":[]}])}
+                        end
+                    else . end))
+            else . end))'
+}
+
+ensure_instance_entry() {
+    local account="$1" project="$2" zone="$3" instance="$4" interval="$5" monitor="$6"
+    config_jq --arg acc "$account" --arg proj "$project" --arg z "$zone" --arg inst "$instance" --argjson int "$interval" --argjson mon "$monitor" '
+        .accounts = (.accounts | map(
+            if .account == $acc then
+                .projects = (.projects // [] | map(
+                    if .id == $proj then
+                        .zones = (.zones // [] | map(
+                            if .name == $z then
+                                if (.instances // [] | map(.name == $inst) | any) then
+                                    .instances = (.instances | map(if .name == $inst then . + {interval:$int, monitor:$mon} else . end))
+                                else
+                                    .instances = ((.instances // []) + [{"name":$inst,"interval":$int,"monitor":$mon}])
+                                end
+                                .
+                            else . end))
+                    else . end))
+            else . end))'
 }
 
 activate_account() {
-    local account=$1
-    local acc_info=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE")
-    
-    if [ -z "$acc_info" ] || [ "$acc_info" = "null" ]; then
-        log ERROR "账号 $account 未在配置文件中找到"
+    local account="$1"
+    local info
+    info=$(jq -r --arg acc "$account" '.accounts[] | select(.account == $acc)' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$info" ] || [ "$info" = "null" ]; then
+        log ERROR "账号 $account 未配置"
         return 1
     fi
-
-    local acc_type
-    acc_type=$(echo "$acc_info" | jq -r '.type // "service"')
-    
-    if [ "$acc_type" = "service" ]; then
-        local key_file
-        key_file=$(echo "$acc_info" | jq -r '.key_file // ""')
-        if [ -z "$key_file" ] || [ ! -f "$key_file" ]; then
-            log ERROR "账号 $account 的密钥文件不存在，请重新导入"
+    local type key_file
+    type=$(echo "$info" | jq -r '.type // "service"')
+    key_file=$(echo "$info" | jq -r '.key_file // ""')
+    if [ "$type" = "service" ]; then
+        if [ ! -f "$key_file" ]; then
+            log ERROR "账号 $account 的密钥缺失"
             return 1
         fi
         if ! gcloud auth activate-service-account "$account" --key-file="$key_file" --quiet >/dev/null 2>&1; then
-            log ERROR "账号 $account 激活失败，请检查密钥文件权限与内容"
+            log ERROR "账号 $account 激活失败"
             return 1
         fi
         gcloud config set account "$account" >/dev/null 2>&1 || true
     else
         if ! gcloud auth list --filter="account:$account" --format="value(account)" 2>/dev/null | grep -qx "$account"; then
-            log ERROR "账号 $account 尚未登录，请先执行 gcloud auth login"
+            log ERROR "账号 $account 未登录，请先执行 gcloud auth login"
             return 1
         fi
-        if ! gcloud config set account "$account" >/dev/null 2>&1; then
-            log ERROR "无法切换到账号 $account，请检查登录状态"
-            return 1
-        fi
+        gcloud config set account "$account" >/dev/null 2>&1 || true
     fi
-
     return 0
 }
 
 get_instance_status() {
-    local account="$1"
-    local project="$2"
-    local zone="$3"
-    local instance="$4"
-
-    local status_output
-    if ! status_output=$(gcloud compute instances describe "$instance" \
-        --zone="$zone" --project="$project" --account="$account" \
-        --format='value(status)' 2>&1); then
-        local first_line
-        first_line=$(printf '%s\n' "$status_output" | head -n1)
-        log WARN "[$account/$project/$zone/$instance] 获取状态失败: ${first_line:-未知错误}"
+    local account="$1" project="$2" zone="$3" instance="$4"
+    local output
+    if ! output=$(gcloud compute instances describe "$instance" --zone="$zone" --project="$project" --account="$account" --format='value(status)' 2>&1); then
+        log WARN "[$account/$project/$zone/$instance] 获取状态失败: $(echo "$output" | head -n1)"
         echo "UNKNOWN"
         return 1
     fi
-
-    if [ -z "$status_output" ]; then
+    if [ -z "$output" ]; then
         echo "UNKNOWN"
         return 1
     fi
-
-    echo "$status_output"
+    echo "$output"
     return 0
 }
 
-should_attempt_start() {
-    local status="$1"
-    case "$status" in
-        RUNNING|PROVISIONING|STAGING|REPAIRING)
-            return 1
-            ;;
-        STOPPED|TERMINATED|STOPPING|SUSPENDED|SUSPENDING|DEPROVISIONED|PREEMPTED|ERROR|UNKNOWN|"")
-            return 0
-            ;;
-        *)
-            return 0
-            ;;
+should_start() {
+    case "$1" in
+        RUNNING|PROVISIONING|STAGING|REPAIRING) return 1 ;;
+        *) return 0 ;;
     esac
+}
+
+wait_for_running() {
+    local account="$1" project="$2" zone="$3" instance="$4"
+    local waited=0
+    while [ $waited -lt $WAIT_SECONDS_FOR_RUNNING ]; do
+        sleep $STATUS_POLL_INTERVAL
+        local st
+        st=$(gcloud compute instances describe "$instance" --zone="$zone" --project="$project" --account="$account" --format='value(status)' 2>/dev/null || echo "UNKNOWN")
+        if [ "$st" = "RUNNING" ]; then
+            return 0
+        fi
+        waited=$((waited + STATUS_POLL_INTERVAL))
+    done
+    return 1
+}
+
+start_instance() {
+    local account="$1" project="$2" zone="$3" instance="$4"
+    local attempt=1
+    while [ $attempt -le $START_RETRY ]; do
+        log WARN "[$account/$project/$zone/$instance] 触发启动 (第 $attempt 次)"
+        activate_account "$account" || return 1
+        local output
+        if output=$(gcloud compute instances start "$instance" --zone="$zone" --project="$project" --account="$account" --quiet 2>&1); then
+            if wait_for_running "$account" "$project" "$zone" "$instance"; then
+                log INFO "[$account/$project/$zone/$instance] 已启动并处于 RUNNING"
+                return 0
+            else
+                log WARN "[$account/$project/$zone/$instance] 启动命令成功但未在超时时间内进入 RUNNING"
+            fi
+        else
+            log ERROR "[$account/$project/$zone/$instance] 启动失败: $(echo "$output" | head -n1)"
+        fi
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    return 1
+}
+
+record_last_check() {
+    local account="$1" project="$2" zone="$3" instance="$4"
+    local name="${account//@/_}_${project}_${zone}_${instance}"
+    echo "$(date +%s)" > "$LASTCHECK_DIR/$name" 2>/dev/null || true
 }
 
 check_single_instance() {
-    local account=$1
-    local project=$2
-    local zone=$3
-    local instance=$4
-    
-    if ! activate_account "$account"; then
-        log ERROR "[$account/$project/$zone/$instance] 激活账号失败，无法执行检查"
-        return 1
-    fi
-    
-    local status
+    local account="$1" project="$2" zone="$3" instance="$4"
+    activate_account "$account" || return 1
+    local status status_rc
     status=$(get_instance_status "$account" "$project" "$zone" "$instance")
-    local status_rc=$?
-    
-    log INFO "[$account/$project/$zone/$instance] 状态: $status"
-    
-    if should_attempt_start "$status"; then
-        log WARN "[$account/$project/$zone/$instance] 不在运行状态，正在启动..."
-        local start_output
-        if start_output=$(gcloud compute instances start "$instance" \
-            --zone="$zone" --project="$project" --account="$account" --quiet 2>&1); then
-            log INFO "[$account/$project/$zone/$instance] 启动命令已发送"
-            
-            echo "等待实例启动..."
-            local max_wait=30
-            local waited=0
-            while [ $waited -lt $max_wait ]; do
-                sleep 2
-                local new_status=$(gcloud compute instances describe "$instance" \
-                    --zone="$zone" --project="$project" --account="$account" \
-                    --format='value(status)' 2>/dev/null || echo "UNKNOWN")
-                if [ "$new_status" = "RUNNING" ]; then
-                    log INFO "[$account/$project/$zone/$instance] 实例已成功启动"
-                    break
-                fi
-                waited=$((waited + 2))
-            done
-        else
-            local first_line
-            first_line=$(printf '%s\n' "$start_output" | head -n1)
-            log ERROR "[$account/$project/$zone/$instance] 启动失败: ${first_line:-未知错误}"
-        fi
-    elif [ "$status" = "RUNNING" ]; then
-        echo "实例状态正常：RUNNING"
-    elif [ "$status_rc" -ne 0 ]; then
-        log WARN "[$account/$project/$zone/$instance] 状态未知，暂未尝试启动"
-    fi
-    
-    local lastcheck_file="$LASTCHECK_DIR/${account//[@.]/_}_${project}_${zone}_${instance}"
-    echo "$(date +%s)" > "$lastcheck_file"
-}
-
-add_account() {
-    echo
-    echo "===== 添加 Google Cloud 账号 ====="
-    echo "1) 使用服务账号 JSON 密钥文件（推荐）"
-    echo "2) 粘贴 JSON 密钥内容"
-    echo "3) 使用个人 Google 账号登录"
-    echo "0) 返回主菜单"
-    
-    read -p "请选择 [0-3]: " choice
-    
-    case $choice in
-        1)
-            read -p "请输入 JSON 密钥文件的完整路径: " json_path
-            json_path=$(expand_user_path "$json_path")
-            if [ ! -f "$json_path" ]; then
-                echo "文件不存在！"
-                return 1
-            fi
-
-            local account_email
-            account_email=$(jq -r '.client_email // empty' "$json_path" 2>/dev/null)
-            if [ -z "$account_email" ]; then
-                echo "无法从密钥文件读取账号信息"
-                return 1
-            fi
-
-            local stored_key
-            stored_key=$(store_service_account_key "$account_email" "$json_path") || {
-                echo "保存密钥文件失败，请检查权限"
-                return 1
-            }
-            
-            gcloud auth activate-service-account --key-file="$stored_key" 2>/dev/null || {
-                echo "认证失败，请检查密钥文件"
-                return 1
-            }
-            
-            local account="$account_email"
-
-            persist_account_entry "$account" "service" "$stored_key"
-            
-            log INFO "成功添加服务账号: $account"
-            
-            read -p "是否自动发现并导入该账号下的所有实例？[y/N]: " auto_discover
-            if [[ "$auto_discover" =~ ^[Yy]$ ]]; then
-                auto_discover_resources "$account"
-            fi
-            ;;
-            
-        2)
-            echo "请粘贴 JSON 密钥内容，按 Ctrl+D 结束："
-            json_file="/tmp/gcpsc_key_$(date +%s).json"
-            cat > "$json_file"
-
-            local account_email
-            account_email=$(jq -r '.client_email // empty' "$json_file" 2>/dev/null)
-            if [ -z "$account_email" ]; then
-                echo "密钥内容格式不正确"
-                rm -f "$json_file"
-                return 1
-            fi
-
-            local stored_key
-            stored_key=$(store_service_account_key "$account_email" "$json_file") || {
-                echo "保存密钥文件失败，请检查权限"
-                rm -f "$json_file"
-                return 1
-            }
-            
-            [ "$stored_key" != "$json_file" ] && rm -f "$json_file"
-
-            gcloud auth activate-service-account --key-file="$stored_key" 2>/dev/null || {
-                echo "认证失败，请检查密钥内容"
-                rm -f "$stored_key"
-                return 1
-            }
-            
-            local account="$account_email"
-
-            persist_account_entry "$account" "service" "$stored_key"
-            
-            log INFO "成功添加服务账号: $account"
-            
-            read -p "是否自动发现并导入该账号下的所有实例？[y/N]: " auto_discover
-            if [[ "$auto_discover" =~ ^[Yy]$ ]]; then
-                auto_discover_resources "$account"
-            fi
-            ;;
-            
-        3)
-            echo "即将打开浏览器认证链接..."
-            gcloud auth login --no-launch-browser
-            
-            account=$(gcloud config get-value account 2>/dev/null)
-            if [ -z "$account" ]; then
-                echo "未检测到登录账号，请确认认证流程是否完成"
-                return 1
-            fi
-
-            persist_account_entry "$account" "user"
-            
-            log INFO "成功添加个人账号: $account"
-            
-            read -p "是否自动发现并导入该账号下的所有实例？[y/N]: " auto_discover
-            if [[ "$auto_discover" =~ ^[Yy]$ ]]; then
-                auto_discover_resources "$account"
-            fi
-            ;;
-            
-        0)
-            return 0
-            ;;
-            
-        *)
-            echo "无效选择"
-            ;;
-    esac
-}
-
-auto_discover_resources() {
-    local account=$1
-    
-    echo
-    echo "正在扫描账号下的所有资源，请稍候..."
-    
-    if ! activate_account "$account"; then
-        echo "账号激活失败，请检查认证信息"
-        return 1
-    fi
-    
-    local projects=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>/dev/null)
-    
-    if [ -z "$projects" ]; then
-        echo "未发现任何项目"
-        return 1
-    fi
-    
-    local total_instances=0
-    local new_instances=0
-    local default_interval=10
-    
-    echo "发现的项目："
-    echo "$projects"
-    echo
-    
-    read -p "请输入默认检查间隔（分钟，默认10）: " user_interval
-    [ -n "$user_interval" ] && default_interval=$user_interval
-    
-    echo
-    echo "开始导入实例..."
-    
-    while IFS= read -r project_id; do
-        [ -z "$project_id" ] && continue
-        echo "正在扫描项目: $project_id"
-        ensure_project_entry "$account" "$project_id"
-
-        local instances_info=$(gcloud compute instances list --project="$project_id" \
-            --account="$account" \
-            --format="csv[no-heading](name,zone,status)" 2>/dev/null)
-        
-        if [ -z "$instances_info" ]; then
-            echo "  项目 $project_id 中没有实例"
-            continue
-        fi
-        
-        while IFS=',' read -r instance_name zone_full status; do
-            [ -z "$instance_name" ] && continue
-            
-            zone=$(echo "$zone_full" | rev | cut -d'/' -f1 | rev)
-            
-            total_instances=$((total_instances + 1))
-            echo "  发现实例: $instance_name (区域: $zone, 状态: $status)"
-            ensure_zone_entry "$account" "$project_id" "$zone"
-            
-            local instance_exists=$(jq -r --arg acc "$account" --arg proj "$project_id" --arg z "$zone" --arg inst "$instance_name" \
-                '.accounts[] | select(.account == $acc) | .projects[] | select(.id == $proj) | .zones[] | select(.name == $z) | .instances[] | select(.name == $inst) | .name' \
-                "$CONFIG_FILE" 2>/dev/null)
-            
-            if [ -z "$instance_exists" ]; then
-                ensure_instance_entry "$account" "$project_id" "$zone" "$instance_name" "$default_interval" true
-                new_instances=$((new_instances + 1))
-                echo "  立即检查实例状态..."
-                check_single_instance "$account" "$project_id" "$zone" "$instance_name"
-            else
-                ensure_instance_entry "$account" "$project_id" "$zone" "$instance_name" "$default_interval" true
-                echo "    实例已存在，跳过"
-            fi
-        done <<< "$instances_info"
-    done <<< "$projects"
-    
-    echo
-    echo "========================================="
-    echo "自动发现完成！"
-    echo "发现实例总数: $total_instances"
-    echo "新导入实例数: $new_instances"
-    echo "========================================="
-    log INFO "账号 $account 自动发现完成，新导入 $new_instances 个实例（共发现 $total_instances 个）"
-    
-    read -p "按回车继续..."
-}
-
-delete_account_menu() {
-    local accounts_list=$(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
-    if [ -z "$accounts_list" ]; then
-        echo "当前没有可删除的账号"
-        return
-    fi
-
-    echo
-    echo "===== 删除账号 ====="
-    local idx=1
-    while IFS= read -r acc; do
-        echo "$idx) $acc"
-        idx=$((idx+1))
-    done <<< "$accounts_list"
-
-    read -p "请输入要删除的账号序号: " del_choice
-    local target=$(echo "$accounts_list" | sed -n "${del_choice}p")
-    if [ -z "$target" ]; then
-        echo "无效选择"
-        return
-    fi
-
-    read -p "确认删除账号 $target 及其所有配置？[y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if remove_account_entry "$target"; then
-            echo "账号 $target 已删除"
-        else
-            echo "删除账号失败，请检查日志"
-        fi
+    status_rc=$?
+    log INFO "[$account/$project/$zone/$instance] 当前状态: $status"
+    record_last_check "$account" "$project" "$zone" "$instance"
+    if should_start "$status"; then
+        start_instance "$account" "$project" "$zone" "$instance"
     else
-        echo "已取消删除操作"
+        if [ "$status_rc" -ne 0 ]; then
+            log WARN "[$account/$project/$zone/$instance] 状态未知，暂不操作"
+        fi
     fi
 }
 
-show_accounts_menu() {
-    while true; do
-        local accounts_array=()
-        mapfile -t accounts_array < <(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
-
-        if [ "${#accounts_array[@]}" -eq 0 ]; then
-            echo
-            echo "当前尚未添加账号，请先完成配置"
-            echo "1) 添加新账号"
-            echo "0) 返回主菜单"
-            read -p "请选择 [0-1]: " empty_choice
-            case "$empty_choice" in
-                1)
-                    add_account
-                    continue
-                    ;;
-                0)
-                    return 0
-                    ;;
-                *)
-                    echo "无效输入"
-                    continue
-                    ;;
-            esac
-        fi
-
-        echo
-        echo "===== 已添加的账号 ====="
-
-        local idx=1
-        for acc in "${accounts_array[@]}"; do
-            local count
-            count=$(jq -r --arg acc "$acc" \
-                '[.accounts[] | select(.account == $acc) | .projects[].zones[].instances[]] | length' \
-                "$CONFIG_FILE" 2>/dev/null)
-            [ -z "$count" ] && count=0
-            echo "$idx) $acc (监控 $count 个实例)"
-            idx=$((idx + 1))
-        done
-
-        local add_option=$idx
-        local delete_option=$((idx + 1))
-
-        echo
-        echo "$add_option) 添加新账号"
-        echo "$delete_option) 删除账号"
-        echo "0) 返回主菜单"
-
-        read -p "请选择 [0-$delete_option]: " choice
-
-        if [ "$choice" = "0" ]; then
-            return 0
-        elif [ "$choice" = "$add_option" ]; then
-            add_account
-            continue
-        elif [ "$choice" = "$delete_option" ]; then
-            delete_account_menu
-            continue
-        elif [[ "$choice" =~ ^[0-9]+$ ]]; then
-            local selected_index=$((choice - 1))
-            if [ "$selected_index" -ge 0 ] && [ "$selected_index" -lt "${#accounts_array[@]}" ]; then
-                show_account_instances "${accounts_array[$selected_index]}"
-            else
-                echo "无效选择"
-            fi
-        else
-            echo "无效输入"
-        fi
-    done
+list_instances_for_account() {
+    local account="$1"
+    jq -r --arg acc "$account" '
+        .accounts[] | select(.account==$acc) |
+        .projects[]? as $p |
+        $p.zones[]? as $z |
+        $z.instances[]? |
+        "",$p.id,"",$z.name,"",.name,"",(.monitor//true),"",(.interval//10)'
+        "$CONFIG_FILE"
 }
 
-show_account_instances() {
-    local account=$1
-    
-    while true; do
-        echo
-        echo "===== 账号: $account ====="
-        echo
-        
-        local instances_list=$(jq -r --arg acc "$account" '
-            .accounts[] | select(.account == $acc) | 
-            .projects[] as $p | 
-            $p.zones[] as $z | 
-            $z.instances[] | 
-            "\($p.id)|\($z.name)|\(.name)|\((.monitor // true) | tostring)|\(.interval // 10)"
-        ' "$CONFIG_FILE" 2>/dev/null)
-        
-        if [ -z "$instances_list" ]; then
-            echo "该账号下没有监控的实例"
-            echo
-            echo "1) 自动发现并导入所有实例"
-            echo "0) 返回"
-            
-            read -p "请选择 [0-1]: " choice
-            case $choice in
-                1) auto_discover_resources "$account" ;;
-                0) return 0 ;;
-            esac
+refresh_account_inventory() {
+    local account="$1" default_interval="$2"
+    activate_account "$account" || return
+    local projects
+    projects=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>/dev/null)
+    if [ -z "$projects" ]; then
+        log WARN "账号 $account 未获取到项目列表"
+        return
+    fi
+    while IFS= read -r proj; do
+        [ -z "$proj" ] && continue
+        ensure_project_entry "$account" "$proj"
+        local instances
+        instances=$(gcloud compute instances list --project="$proj" --account="$account" --format="csv[no-heading](name,zone)" 2>/dev/null)
+        [ -z "$instances" ] && continue
+        while IFS=',' read -r inst zone_full; do
+            [ -z "$inst" ] && continue
+            local zone="${zone_full##*/}"
+            ensure_zone_entry "$account" "$proj" "$zone"
+            ensure_instance_entry "$account" "$proj" "$zone" "$inst" "${default_interval:-$DEFAULT_INTERVAL_MIN}" true
+        done <<< "$instances"
+    done <<< "$projects"
+    log INFO "账号 $account 资源发现完成"
+}
+
+check_all_instances() {
+    local target_account="${1:-}" refresh="${2:-true}"
+    local starts_in_cycle=0
+    local accounts_json
+    accounts_json=$(jq -c '.accounts[]?' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$accounts_json" ]; then
+        log WARN "未配置任何账号"
+        return
+    fi
+    while IFS= read -r acc_json; do
+        [ -z "$acc_json" ] && continue
+        local account
+        account=$(echo "$acc_json" | jq -r '.account')
+        if [ -n "$target_account" ] && [ "$account" != "$target_account" ]; then
             continue
         fi
-        
-        echo "实例列表："
-        echo "---------------------------------------------------------------"
-        printf "%-3s %-30s %-18s %-6s %-10s\n" "No" "实例名" "区域" "监控" "检查间隔"
-        echo "---------------------------------------------------------------"
-        
-        local i=1
-        while IFS='|' read -r proj zone inst monitor interval; do
-            local monitor_label="关闭"
-            [ "$monitor" = "true" ] && monitor_label="开启"
-            printf "%-3d %-30s %-18s %-6s %d分钟\n" "$i" "$inst" "$zone" "$monitor_label" "$interval"
-            i=$((i+1))
-        done <<< "$instances_list"
-        
-        echo "---------------------------------------------------------------"
-        echo
-        echo "操作选项："
-        echo "1) 立即检查指定实例"
-        echo "2) 切换实例监控开关"
-        echo "3) 修改实例检查间隔"
-        echo "4) 批量修改所有实例检查间隔"
-        echo "5) 删除实例监控"
-        echo "6) 自动发现新实例"
-        echo "7) 查看实例详情"
-        echo "0) 返回"
-        
-        read -p "请选择 [0-7]: " choice
-        
-        case $choice in
-            1)
-                read -p "请输入要检查的实例序号: " inst_num
-                local selected=$(echo "$instances_list" | sed -n "${inst_num}p")
-                if [ -n "$selected" ]; then
-                    IFS='|' read -r proj zone inst monitor interval <<< "$selected"
-                    echo "正在检查实例 $inst ..."
-                    check_single_instance "$account" "$proj" "$zone" "$inst"
-                    read -p "按回车继续..."
-                fi
-                ;;
+        if [ "$refresh" = "true" ]; then
+            refresh_account_inventory "$account" "$DEFAULT_INTERVAL_MIN"
+        fi
+        local lines
+        lines=$(list_instances_for_account "$account")
+        if [ -z "$lines" ]; then
+            log INFO "账号 $account 没有配置实例"
+            continue
+        fi
+        while IFS=$'\1' read -r proj zone inst monitor interval; do
+            [ -z "$proj" ] && continue
+            if [ "$monitor" != "true" ]; then
+                log INFO "[$account/$proj/$zone/$inst] 监控关闭"
+                continue
+            fi
+            if [ "$starts_in_cycle" -ge "$MAX_PARALLEL_STARTS" ]; then
+                log WARN "已达到本轮启动上限 $MAX_PARALLEL_STARTS，跳过 [$account/$proj/$zone/$inst]"
+                continue
+            fi
+            check_single_instance "$account" "$proj" "$zone" "$inst"
+            local last_status
+            last_status=$(get_instance_status "$account" "$proj" "$zone" "$inst")
+            if [ "$last_status" != "RUNNING" ] && should_start "$last_status"; then
+                starts_in_cycle=$((starts_in_cycle + 1))
+            fi
+        done <<< "$lines"
+    done <<< "$accounts_json"
+}
 
+# 交互式菜单
+
+pause() { read -p "按回车继续..." _; }
+
+select_account() {
+    local accounts
+    accounts=$(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
+    if [ -z "$accounts" ]; then
+        echo ""
+        return 1
+    fi
+    local idx=1
+    echo "可用账号："
+    while IFS= read -r acc; do
+        echo "  $idx) $acc"
+        idx=$((idx + 1))
+    done <<< "$accounts"
+    read -p "请选择账号序号: " sel
+    if ! [[ "$sel" =~ ^[0-9]+$ ]]; then
+        echo ""
+        return 1
+    fi
+    local chosen
+    chosen=$(echo "$accounts" | sed -n "${sel}p")
+    echo "$chosen"
+}
+
+menu_accounts() {
+    while true; do
+        clear
+        echo "===== 账号管理 ====="
+        echo "1) 添加服务账号(导入 key 文件)"
+        echo "2) 添加已登录的用户账号"
+        echo "3) 删除账号"
+        echo "4) 查看账号详情"
+        echo "0) 返回主菜单"
+        read -p "请选择 [0-4]: " c
+        case "$c" in
+            1)
+                read -p "请输入服务账号 email: " acc
+                read -p "请输入 key 文件路径: " key_path
+                key_path=$(expand_user_path "$key_path")
+                if [ ! -f "$key_path" ]; then
+                    echo "文件不存在"; pause; continue
+                fi
+                persist_account_entry "$acc" "service" "$(store_service_account_key "$acc" "$key_path")"
+                log INFO "添加服务账号 $acc"
+                pause
+                ;;
             2)
-                read -p "请输入要切换的实例序号: " inst_num
-                local selected=$(echo "$instances_list" | sed -n "${inst_num}p")
-                if [ -n "$selected" ]; then
-                    IFS='|' read -r proj zone inst monitor interval <<< "$selected"
-                    local new_state="true"
-                    local action_label="启用"
-                    if [ "$monitor" = "true" ]; then
-                        new_state="false"
-                        action_label="禁用"
-                    fi
-                    jq --arg acc "$account" --arg proj "$proj" --arg z "$zone" --arg inst "$inst" --argjson mon "$new_state" '
-                        (.accounts[] | select(.account == $acc) | .projects[] | select(.id == $proj) | .zones[] | select(.name == $z) | .instances[] | select(.name == $inst) | .monitor) = $mon
-                    ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-                    echo "已$action_label实例 $inst 的监控"
-                    log INFO "实例监控开关: $account/$proj/$zone/$inst -> $action_label"
+                read -p "请输入用户账号 email(需已通过 gcloud auth login 登录): " acc
+                if ! gcloud auth list --format="value(account)" 2>/dev/null | grep -qx "$acc"; then
+                    echo "未在 gcloud 中找到该账号，请先执行 gcloud auth login"
+                else
+                    persist_account_entry "$acc" "user" ""
+                    log INFO "添加用户账号 $acc"
                 fi
+                pause
                 ;;
-                
             3)
-                read -p "请输入要修改的实例序号: " inst_num
-                local selected=$(echo "$instances_list" | sed -n "${inst_num}p")
-                if [ -n "$selected" ]; then
-                    IFS='|' read -r proj zone inst monitor old_interval <<< "$selected"
-                    read -p "请输入新的检查间隔（分钟，当前: $old_interval）: " new_interval
-                    if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 1 ]; then
-                        jq --arg acc "$account" --arg proj "$proj" --arg z "$zone" --arg inst "$inst" --argjson int "$new_interval" \
-                            '(.accounts[] | select(.account == $acc) | .projects[] | select(.id == $proj) | .zones[] | select(.name == $z) | .instances[] | select(.name == $inst) | .interval) = $int' \
-                            "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-                        echo "已更新 $inst 的检查间隔为 $new_interval 分钟"
-                        log INFO "更新实例检查间隔: $account/$proj/$zone/$inst -> ${new_interval}分钟"
-                        
-                        echo "立即执行一次检查..."
-                        check_single_instance "$account" "$proj" "$zone" "$inst"
-                    fi
+                local acc
+                acc=$(select_account) || { echo "暂无账号"; pause; continue; }
+                read -p "确认删除 $acc ? [y/N]: " yn
+                if [[ "$yn" =~ ^[Yy]$ ]]; then
+                    remove_account_entry "$acc"
                 fi
+                pause
                 ;;
-                
             4)
-                read -p "请输入新的检查间隔（分钟）: " new_interval
-                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 1 ]; then
-                    jq --arg acc "$account" --argjson int "$new_interval" \
-                        '(.accounts[] | select(.account == $acc) | .projects[].zones[].instances[].interval) = $int' \
-                        "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-                    echo "已更新所有实例的检查间隔为 $new_interval 分钟"
-                    log INFO "账号 $account 所有实例检查间隔更新为 $new_interval 分钟"
-                    
-                    read -p "是否立即检查所有实例？[y/N]: " check_now
-                    if [[ "$check_now" =~ ^[Yy]$ ]]; then
-                        echo "正在检查所有实例..."
-                        while IFS='|' read -r proj zone inst monitor interval; do
-                            check_single_instance "$account" "$proj" "$zone" "$inst"
-                        done <<< "$instances_list"
-                    fi
-                fi
+                local acc
+                acc=$(select_account) || { echo "暂无账号"; pause; continue; }
+                echo "账号: $acc"
+                jq -r --arg acc "$acc" '
+                    .accounts[] | select(.account==$acc) | .projects[]? as $p |
+                    $p.zones[]? as $z | $z.instances[]? | "  " + $p.id + "/" + $z.name + "/" + .name + " (interval=" + ((.interval//10)|tostring) + "m, monitor=" + ((.monitor//true)|tostring) + ")"' "$CONFIG_FILE"
+                pause
                 ;;
-                
-            5)
-                read -p "请输入要删除的实例序号: " inst_num
-                local selected=$(echo "$instances_list" | sed -n "${inst_num}p")
-                if [ -n "$selected" ]; then
-                    IFS='|' read -r proj zone inst monitor interval <<< "$selected"
-                    read -p "确认删除实例 $inst 的监控？[y/N]: " confirm
-                    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                        jq --arg acc "$account" --arg proj "$proj" --arg z "$zone" --arg inst "$inst" '
-                            .accounts = (.accounts | map(
-                                if .account == $acc then
-                                    .projects = ((.projects // []) | map(
-                                        if .id == $proj then
-                                            .zones = ((.zones // []) | map(
-                                                if .name == $z then
-                                                    .instances = ((.instances // []) | map(select(.name != $inst)))
-                                                else .
-                                                end
-                                            ) | map(select((.instances | length) > 0)))
-                                        else .
-                                        end
-                                    ) | map(select((.zones | length) > 0)))
-                                else .
-                                end
-                            ))
-                        ' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-                        rm -f "$LASTCHECK_DIR/${account//[@.]/_}_${proj}_${zone}_${inst}"
-                        echo "已删除实例监控"
-                        log INFO "删除实例监控: $account/$proj/$zone/$inst"
-                    fi
-                fi
-                ;;
-                
-            6)
-                auto_discover_resources "$account"
-                ;;
-                
-            7)
-                read -p "请输入要查看的实例序号: " inst_num
-                local selected=$(echo "$instances_list" | sed -n "${inst_num}p")
-                if [ -n "$selected" ]; then
-                    IFS='|' read -r proj zone inst monitor interval <<< "$selected"
-                    echo
-                    echo "实例详情："
-                    echo "  账号: $account"
-                    echo "  项目: $proj"
-                    echo "  区域: $zone"
-                    echo "  实例: $inst"
-                    echo "  检查间隔: $interval 分钟"
-                    local monitor_text="关闭"
-                    [ "$monitor" = "true" ] && monitor_text="开启"
-                    echo "  监控状态: $monitor_text"
-                    
-                    local lastcheck_file="$LASTCHECK_DIR/${account//[@.]/_}_${proj}_${zone}_${inst}"
-                    if [ -f "$lastcheck_file" ]; then
-                        local lastcheck=$(cat "$lastcheck_file")
-                        echo "  最后检查: $(date -d "@$lastcheck" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || date -r "$lastcheck" "+%Y-%m-%d %H:%M:%S")"
-                    else
-                        echo "  最后检查: 尚未执行"
-                    fi
-                    
-                    echo
-                    echo "正在获取实例当前状态..."
-                    activate_account "$account"
-                    local current_status=$(gcloud compute instances describe "$inst" \
-                        --zone="$zone" --project="$proj" --account="$account" \
-                        --format='get(status)' 2>/dev/null || echo "无法获取")
-                    echo "  当前状态: $current_status"
-                    
-                    echo
-                    read -p "按回车继续..."
-                fi
-                ;;
-                
-            0)
-                return 0
-                ;;
-                
-            *)
-                echo "无效选择"
-                ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
         esac
     done
 }
 
-check_all_instances() {
-    local target_account="${1:-}"
-    local accounts_json
-    accounts_json=$(jq -c '.accounts[]?' "$CONFIG_FILE" 2>/dev/null)
-
-    if [ -z "$accounts_json" ]; then
-        log WARN "未配置任何账号，跳过巡检"
-        return 0
-    fi
-
-    local starts_in_cycle=0
-    local matched_account=0
-
-    while IFS= read -r account_json; do
-        [ -z "$account_json" ] && continue
-
-        local account
-        account=$(echo "$account_json" | jq -r '.account // empty')
-        if [ -z "$account" ] || [ "$account" = "null" ]; then
-            continue
-        fi
-
-        if [ -n "$target_account" ] && [ "$account" != "$target_account" ]; then
-            continue
-        fi
-
-        matched_account=1
-
-        if ! activate_account "$account"; then
-            log ERROR "账号 $account 激活失败，已跳过"
-            continue
-        fi
-
-        refresh_account_inventory "$account"
-
-        local instances_list
-        instances_list=$(jq -r --arg acc "$account" '
-            .accounts[] | select(.account == $acc) |
-            .projects[]? as $p |
-            $p.zones[]? as $z |
-            $z.instances[]? |
-            "\($p.id)\t\($z.name)\t\(.name)\t\((.monitor // true) | tostring)\t\(.interval // 10)"
-        ' "$CONFIG_FILE" 2>/dev/null)
-
-        if [ -z "$instances_list" ]; then
-            log INFO "账号 $account 没有配置需要监控的实例"
-            continue
-        fi
-
-        while IFS=$'\t' read -r project zone instance monitor_flag interval; do
-            [ -z "$project" ] && continue
-
-            if [ "$monitor_flag" != "true" ]; then
-                log INFO "[$account/$project/$zone/$instance] 监控已关闭，跳过"
-                continue
-            fi
-
-            local status
-            status=$(get_instance_status "$account" "$project" "$zone" "$instance")
-            local status_rc=$?
-            log INFO "[$account/$project/$zone/$instance] 状态: $status"
-
-            local lastcheck_file="$LASTCHECK_DIR/${account//[@.]/_}_${project}_${zone}_${instance}"
-            echo "$(date +%s)" > "$lastcheck_file" 2>/dev/null || true
-
-            if should_attempt_start "$status"; then
-                if [ "$starts_in_cycle" -ge "$MAX_PARALLEL_STARTS" ]; then
-                    log WARN "[$account/$project/$zone/$instance] 已达到当前巡检启动上限 $MAX_PARALLEL_STARTS，跳过本次启动"
-                    continue
-                fi
-
-                log WARN "[$account/$project/$zone/$instance] 检测到实例停止，正在尝试启动..."
-                local start_output
-                if start_output=$(gcloud compute instances start "$instance" \
-                    --zone="$zone" --project="$project" --account="$account" --quiet 2>&1); then
-                    starts_in_cycle=$((starts_in_cycle + 1))
-                    log INFO "[$account/$project/$zone/$instance] 启动命令已下发，验证状态..."
-
-                    local waited=0
-                    local max_wait=60
-                    while [ $waited -lt $max_wait ]; do
-                        sleep 5
-                        local new_status
-                        new_status=$(gcloud compute instances describe "$instance" \
-                            --zone="$zone" --project="$project" --account="$account" \
-                            --format='value(status)' 2>/dev/null || echo "UNKNOWN")
-                        if [ "$new_status" = "RUNNING" ]; then
-                            log INFO "[$account/$project/$zone/$instance] 已恢复至 RUNNING"
-                            break
-                        fi
-                        waited=$((waited + 5))
-                    done
-                else
-                    local first_line
-                    first_line=$(printf '%s\n' "$start_output" | head -n1)
-                    log ERROR "[$account/$project/$zone/$instance] 启动失败，请检查权限或配额: ${first_line:-未知错误}"
-                fi
-            else
-                if [ "$status" != "RUNNING" ] && [ "$status_rc" -ne 0 ]; then
-                    log WARN "[$account/$project/$zone/$instance] 状态未知，暂不执行启动操作"
-                elif [ "$status" != "RUNNING" ]; then
-                    log INFO "[$account/$project/$zone/$instance] 状态 $status 暂不需要操作"
-                fi
-            fi
-        done <<< "$instances_list"
-    done <<< "$accounts_json"
-
-    if [ -n "$target_account" ] && [ "$matched_account" -eq 0 ]; then
-        log WARN "未找到账号 $target_account 的监控配置"
-    fi
+menu_discover() {
+    clear
+    echo "===== 快速发现资源 ====="
+    local acc
+    acc=$(select_account) || { echo "暂无账号"; pause; return; }
+    read -p "默认检查间隔(分钟，默认$DEFAULT_INTERVAL_MIN): " interval
+    interval=${interval:-$DEFAULT_INTERVAL_MIN}
+    refresh_account_inventory "$acc" "$interval"
+    pause
 }
 
-show_statistics() {
-    echo
+menu_instances() {
+    local acc
+    acc=$(select_account) || { echo "暂无账号"; pause; return; }
+    while true; do
+        clear
+        echo "===== 实例管理 ($acc) ====="
+        echo "1) 列出实例"
+        echo "2) 切换监控开关"
+        echo "3) 修改检查间隔"
+        echo "4) 手动检查某实例"
+        echo "0) 返回"
+        read -p "请选择 [0-4]: " c
+        case "$c" in
+            1)
+                list_instances_for_account "$acc" | while IFS=$'\1' read -r proj zone inst monitor interval; do
+                    echo "- $proj/$zone/$inst (监控:${monitor:-true}, 间隔:${interval:-10}m)"
+                done
+                pause
+                ;;
+            2)
+                local lines
+                lines=$(list_instances_for_account "$acc")
+                if [ -z "$lines" ]; then echo "无实例"; pause; continue; fi
+                local idx=1
+                echo "请选择实例："
+                echo "$lines" | while IFS=$'\1' read -r proj zone inst monitor interval; do
+                    echo "  $idx) $proj/$zone/$inst 当前:${monitor}"
+                    idx=$((idx+1))
+                done
+                read -p "序号: " sel
+                if ! [[ "$sel" =~ ^[0-9]+$ ]]; then pause; continue; fi
+                local chosen
+                chosen=$(echo "$lines" | sed -n "${sel}p")
+                IFS=$'\1' read -r proj zone inst monitor interval <<< "$chosen"
+                local new_flag="true"
+                if [ "$monitor" = "true" ]; then new_flag="false"; fi
+                config_jq --arg acc "$acc" --arg proj "$proj" --arg z "$zone" --arg inst "$inst" --argjson flag "$new_flag" '
+                    .accounts = (.accounts | map(if .account==$acc then .projects = (.projects|map(if .id==$proj then .zones = (.zones|map(if .name==$z then .instances = (.instances|map(if .name==$inst then .+{monitor:$flag} else . end)) else . end)) else . end)) else . end))'
+                log INFO "[$acc/$proj/$zone/$inst] 监控已设置为 $new_flag"
+                pause
+                ;;
+            3)
+                read -p "新间隔(分钟): " new_int
+                if ! [[ "$new_int" =~ ^[0-9]+$ ]] || [ "$new_int" -lt 1 ]; then echo "输入非法"; pause; continue; fi
+                config_jq --arg acc "$acc" --argjson int "$new_int" '
+                    (.accounts[] | select(.account==$acc) | .projects[].zones[].instances[].interval) = $int'
+                log INFO "账号 $acc 所有实例间隔设为 ${new_int}分钟"
+                pause
+                ;;
+            4)
+                local lines
+                lines=$(list_instances_for_account "$acc")
+                if [ -z "$lines" ]; then echo "无实例"; pause; continue; fi
+                local idx=1
+                echo "$lines" | while IFS=$'\1' read -r proj zone inst monitor interval; do
+                    echo "  $idx) $proj/$zone/$inst"
+                    idx=$((idx+1))
+                done
+                read -p "序号: " sel
+                if ! [[ "$sel" =~ ^[0-9]+$ ]]; then pause; continue; fi
+                local chosen
+                chosen=$(echo "$lines" | sed -n "${sel}p")
+                IFS=$'\1' read -r proj zone inst monitor interval <<< "$chosen"
+                check_single_instance "$acc" "$proj" "$zone" "$inst"
+                pause
+                ;;
+            0) return ;;
+            *) echo "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+menu_statistics() {
+    clear
     echo "===== 监控统计 ====="
-    echo "版本: $VERSION ($VERSION_DATE)"
-    echo
-    
-    local total_accounts=$(jq '.accounts | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    local total_projects=$(jq '[.accounts[].projects[]] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    local total_instances=$(jq '[.accounts[].projects[].zones[].instances[]] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-    
-    echo "账号总数: $total_accounts"
-    echo "项目总数: $total_projects"
-    echo "实例总数: $total_instances"
-    echo
-    
-    if [ "$total_instances" -gt 0 ]; then
-        echo "按账号分组："
-        local accounts=$(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
-        while IFS= read -r acc; do
-            local count=$(jq -r --arg acc "$acc" \
-                '[.accounts[] | select(.account == $acc) | .projects[].zones[].instances[]] | length' \
-                "$CONFIG_FILE" 2>/dev/null)
-            echo "  $acc: $count 个实例"
-        done <<< "$accounts"
-        
-        echo
-        echo "实例检查状态："
-        local running_count=0
-        local checked_count=0
-        local now=$(date +%s)
-        
-        for lastcheck_file in "$LASTCHECK_DIR"/*; do
-            [ -f "$lastcheck_file" ] || continue
-            checked_count=$((checked_count + 1))
-            local lastcheck=$(cat "$lastcheck_file")
-            if [ $((now - lastcheck)) -lt 600 ]; then
-                running_count=$((running_count + 1))
-            fi
-        done
-        
-        echo "  已检查过的实例: $checked_count"
-        echo "  最近10分钟活跃: $running_count"
-    fi
-    
-    echo
-    read -p "按回车继续..."
+    local total_accounts total_projects total_instances
+    total_accounts=$(jq '.accounts|length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    total_projects=$(jq '[.accounts[].projects[]] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    total_instances=$(jq '[.accounts[].projects[].zones[].instances[]] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+    echo "账号: $total_accounts"
+    echo "项目: $total_projects"
+    echo "实例: $total_instances"
+    local now=$(date +%s) active=0 checked=0
+    for f in "$LASTCHECK_DIR"/*; do
+        [ -f "$f" ] || continue
+        checked=$((checked+1))
+        local ts
+        ts=$(cat "$f")
+        if [ $((now - ts)) -lt 600 ]; then
+            active=$((active+1))
+        fi
+    done
+    echo "最近10分钟活跃检查: $active / $checked"
+    pause
 }
 
-show_about() {
-    echo
-    echo "$LOGO"
-    echo
-    echo "关于本程序："
-    echo "  名称: Google Cloud Spot Instance 保活服务"
-    echo "  版本: $VERSION"
-    echo "  发布日期: $VERSION_DATE"
-    echo "  作者: crazy0x70"
-    echo "  GitHub: https://github.com/crazy0x70/"
-    echo
-    echo "功能特性："
-    echo "  • 自动监控 GCP Spot 实例状态"
-    echo "  • 实例停止时自动重启"
-    echo "  • 支持多账号、多项目管理"
-    echo "  • 自动发现并导入实例"
-    echo "  • 灵活的检查间隔设置"
-    echo "  • 完整的操作日志记录"
-    echo
-    echo "系统信息："
-    echo "  配置目录: $CONFIG_DIR"
-    echo "  日志文件: $LOG_FILE"
-    echo "  主程序: $GCPSC_SCRIPT"
-    echo
-    read -p "按回车继续..."
+menu_logs() {
+    clear
+    echo "===== 最近日志(尾部100行) ====="
+    tail -n 100 "$LOG_FILE" 2>/dev/null || echo "暂无日志"
+    pause
 }
 
 main_menu() {
     while true; do
         clear
         echo "$LOGO"
-        
-        local instances_count=$(jq '[.accounts[].projects[].zones[].instances[]] | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-        local accounts_count=$(jq '.accounts | length' "$CONFIG_FILE" 2>/dev/null || echo 0)
-        
-        echo "当前状态: $accounts_count 个账号，$instances_count 个实例"
-        echo "日志文件: $LOG_FILE"
+        local acc_count inst_count
+        acc_count=$(jq '.accounts|length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        inst_count=$(jq '[.accounts[].projects[].zones[].instances[]]|length' "$CONFIG_FILE" 2>/dev/null || echo 0)
+        echo "当前: $acc_count 个账号，$inst_count 个实例"
         echo
-        
-        echo "========== 主菜单 =========="
         echo "1) 账号管理"
-        echo "2) 快速发现所有资源"
-        echo "3) 查看监控统计"
-        echo "4) 查看运行日志"
-        echo "5) 手动执行一次检查"
-        echo "6) 关于"
+        echo "2) 快速发现资源"
+        echo "3) 实例监控与操作"
+        echo "4) 查看监控统计"
+        echo "5) 查看运行日志"
+        echo "6) 手动执行一次全量检查"
         echo "0) 退出"
-        echo "============================"
-        echo
         read -p "请选择 [0-6]: " choice
-        
-        case $choice in
-            1)
-                show_accounts_menu
-                ;;
-            2)
-                echo
-                echo "===== 快速发现所有资源 ====="
-                local accounts=$(jq -r '.accounts[].account' "$CONFIG_FILE" 2>/dev/null)
-                if [ -z "$accounts" ]; then
-                    echo "请先添加账号"
-                    read -p "按回车继续..."
-                else
-                    read -p "请输入默认检查间隔（分钟，默认10）: " default_interval
-                    default_interval=${default_interval:-10}
-                    
-                    local total_new=0
-                    while IFS= read -r account; do
-                        echo
-                        echo "处理账号: $account"
-                        activate_account "$account"
-                        
-                        local projects=$(gcloud projects list --account="$account" --filter="lifecycleState=ACTIVE" --format="value(projectId)" 2>/dev/null)
-                        local imported=0
-                        
-                        while IFS= read -r project_id; do
-                            [ -z "$project_id" ] && continue
-                            ensure_project_entry "$account" "$project_id"
-
-                            local instances_info=$(gcloud compute instances list --project="$project_id" \
-                                --account="$account" \
-                                --format="csv[no-heading](name,zone)" 2>/dev/null)
-                            
-                            [ -z "$instances_info" ] && continue
-
-                            while IFS=',' read -r instance_name zone_full; do
-                                [ -z "$instance_name" ] && continue
-                                zone=$(echo "$zone_full" | rev | cut -d'/' -f1 | rev)
-
-                                local instance_exists=$(jq -r --arg acc "$account" --arg proj "$project_id" --arg z "$zone" --arg inst "$instance_name" \
-                                    '.accounts[] | select(.account == $acc) | .projects[] | select(.id == $proj) | .zones[] | select(.name == $z) | .instances[] | select(.name == $inst) | .name' \
-                                    "$CONFIG_FILE" 2>/dev/null)
-                                
-                                if [ -z "$instance_exists" ]; then
-                                    ensure_zone_entry "$account" "$project_id" "$zone"
-                                    ensure_instance_entry "$account" "$project_id" "$zone" "$instance_name" "$default_interval" true
-                                    imported=$((imported + 1))
-                                    echo "  + $project_id/$zone/$instance_name"
-                                    
-                                    check_single_instance "$account" "$project_id" "$zone" "$instance_name"
-                                else
-                                    ensure_zone_entry "$account" "$project_id" "$zone"
-                                    ensure_instance_entry "$account" "$project_id" "$zone" "$instance_name" "$default_interval" true
-                                fi
-                            done <<< "$instances_info"
-                        done <<< "$projects"
-                        
-                        echo "  账号 $account 导入 $imported 个新实例"
-                        total_new=$((total_new + imported))
-                    done <<< "$accounts"
-                    
-                    echo
-                    echo "批量发现完成！共导入 $total_new 个新实例"
-                    log INFO "批量发现完成，共导入 $total_new 个新实例"
-                    read -p "按回车继续..."
-                fi
-                ;;
-            3)
-                show_statistics
-                ;;
-            4)
-                echo
-                echo "===== 最近的日志（最新50条）====="
-                tail -n 50 "$LOG_FILE" 2>/dev/null || echo "暂无日志"
-                echo
-                read -p "按回车继续..."
-                ;;
-            5)
-                echo "正在执行全量检查..."
-                check_all_instances
-                echo "检查完成！"
-                read -p "按回车继续..."
-                ;;
-            6)
-                show_about
-                ;;
-            0)
-                echo
-                echo "感谢使用 GCP Spot Check 服务！"
-                echo "再见！"
-                exit 0
-                ;;
-            *)
-                echo "无效选择"
-                sleep 1
-                ;;
+        case "$choice" in
+            1) menu_accounts ;;
+            2) menu_discover ;;
+            3) menu_instances ;;
+            4) menu_statistics ;;
+            5) menu_logs ;;
+            6) echo "正在执行检查..."; check_all_instances "" false; pause ;;
+            0) echo "再见"; exit 0 ;;
+            *) echo "无效选择"; sleep 1 ;;
         esac
     done
 }
 
+perform_install() {
+    require_root
+    echo "$LOGO"
+    echo "正在安装..."
+    ensure_dirs; ensure_jq; ensure_gcloud; ensure_crontab
+    curl -fsSL "$SCRIPT_URL" -o "$GCPSC_SCRIPT"
+    chmod +x "$GCPSC_SCRIPT"
+    ln -sf "$GCPSC_SCRIPT" /usr/bin/gcpsc
+    log INFO "安装完成，版本 $VERSION"
+    echo "安装完成，使用命令: sudo gcpsc"
+    exec "$GCPSC_SCRIPT" __installed__
+}
+
+perform_uninstall() {
+    require_root
+    echo "$LOGO"
+    read -p "确认卸载并删除配置? [y/N]: " yn
+    if [[ ! "$yn" =~ ^[Yy]$ ]]; then echo "已取消"; exit 0; fi
+    crontab -l 2>/dev/null | grep -v "$GCPSC_SCRIPT" | crontab - 2>/dev/null || true
+    rm -f "$GCPSC_SCRIPT" /usr/bin/gcpsc 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
+    rm -f "$LOG_FILE" 2>/dev/null || true
+    echo "已卸载"
+}
+
 main() {
-    if [ "$1" = "install" ]; then
-        perform_install
-        exit 0
-    elif [ "$1" = "remove" ] || [ "$1" = "uninstall" ]; then
-        perform_uninstall
-        exit 0
+    if [ "${1:-}" = "install" ]; then
+        perform_install; exit 0
+    elif [ "${1:-}" = "remove" ] || [ "${1:-}" = "uninstall" ]; then
+        perform_uninstall; exit 0
     fi
-    
-    if [ "$1" = "check" ]; then
-        shift
-        local target_account=""
-        while [ $# -gt 0 ]; do
-            case "$1" in
-                --account|-a)
-                    if [ -z "${2:-}" ]; then
-                        echo "参数 --account 需要提供账号邮箱"
-                        exit 1
-                    fi
-                    target_account="$2"
-                    shift 2
-                    ;;
-                --help|-h)
-                    cat <<EOF
-用法: gcpsc check [--account <account-email>]
-  不带参数时将巡检所有账号配置
-  --account/-a: 仅巡检指定账号
-EOF
-                    exit 0
-                    ;;
-                *)
-                    echo "未知参数: $1"
-                    echo "使用 --help 查看支持的选项"
-                    exit 1
-                    ;;
-            esac
-        done
-        check_all_instances "$target_account"
-        exit 0
+
+    require_root
+    ensure_dirs; ensure_jq
+
+    local config_ver
+    config_ver=$(jq -r '.version // "0.0.0"' "$CONFIG_FILE" 2>/dev/null)
+    if [ "$config_ver" != "$VERSION" ]; then
+        config_jq --arg v "$VERSION" '.version=$v'
+        log INFO "配置版本更新到 $VERSION"
     fi
-    
-    if [ "$1" = "version" ] || [ "$1" = "-v" ] || [ "$1" = "--version" ]; then
-        echo "GCP Spot Check Version: $VERSION ($VERSION_DATE)"
-        exit 0
-    fi
-    
-    if [ ! -f "$GCPSC_SCRIPT" ] && [ "$1" != "__installed__" ]; then
-        perform_install
-        exit 0
-    fi
-    
-    check_root
-    init_dirs
-    ensure_jq
-    
-    local config_version=$(jq -r '.version // "0.0.0"' "$CONFIG_FILE" 2>/dev/null)
-    if [ "$config_version" != "$VERSION" ]; then
-        jq --arg ver "$VERSION" '.version = $ver' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        log INFO "配置文件版本已更新至 $VERSION"
-    fi
-    
-    main_menu
+
+    case "${1:-}" in
+        check)
+            shift
+            local target="" refresh=true
+            while [ $# -gt 0 ]; do
+                case "$1" in
+                    --account|-a) target="$2"; shift 2 ;;
+                    --no-refresh) refresh=false; shift ;;
+                    --help|-h)
+                        cat <<'EOH'
+用法: gcpsc check [--account <email>] [--no-refresh]
+  --account/-a  仅检查指定账号
+  --no-refresh  跳过检查前的资源发现，直接按配置检查
+EOH
+                        exit 0 ;;
+                    *) echo "未知参数: $1"; exit 1 ;;
+                esac
+            done
+            check_all_instances "$target" "$refresh"
+            exit 0
+            ;;
+        version|-v|--version)
+            echo "GCP Spot Check $VERSION ($VERSION_DATE)"; exit 0 ;;
+        __installed__)
+            main_menu ;;
+        *)
+            main_menu ;;
+    esac
 }
 
 main "$@"
