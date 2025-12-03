@@ -4,7 +4,7 @@ set -uo pipefail
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/opt/google-cloud-sdk/bin:${PATH:-}"
 
-readonly VERSION="1.2"
+readonly VERSION="2.0"
 readonly VERSION_DATE="2025-12-03"
 
 readonly INSTALL_PATH="/usr/local/bin"
@@ -411,7 +411,7 @@ refresh_account_inventory() {
                                         .instances = ((.instances // []) |
                                             if any(.name == $inst) then
                                                 map(if .name == $inst then
-                                                    . + {interval:(.interval // $int), monitor:(.monitor // true)}
+                                                    . + {interval:(.interval // $int), monitor:(if (.monitor|type=="boolean") then .monitor else true end)}
                                                 else . end)
                                             else . + [{name:$inst, interval:$int, monitor:true}] end)
                                     else . end)
@@ -533,7 +533,7 @@ list_instances() {
     config_read --arg acc "$account" '
         .accounts[] | select(.account == $acc) |
         .projects[]? as $p | $p.zones[]? as $z | $z.instances[]? |
-        [$p.id, $z.name, .name, (.monitor//true|tostring), ((.interval//10)|tostring)] | join("\t")
+        [$p.id, $z.name, .name, ((if (.monitor|type=="boolean") then .monitor else true end)|tostring), ((.interval//10)|tostring)] | join("\t")
     '
 }
 
