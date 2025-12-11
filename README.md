@@ -12,20 +12,16 @@
 - 一键安装/卸载：通过 curl | bash 完成安装，找不到自身脚本时自动回退下载。
 
 ## 一键安装 / 卸载
-### 安装
 ```bash
+# 安装
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/crazy0x70/GCP-Spot-Check/refs/heads/main/gcp-spot-check.sh)" @ install
-```
-### 运行管理界面
-```bash
+
+# 运行管理界面
 sudo gcpsc
-```
-### 卸载
-```bash
+
+# 卸载
 sudo gcpsc remove
-```
-或
-```basg
+# 或
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/crazy0x70/GCP-Spot-Check/refs/heads/main/gcp-spot-check.sh)" @ remove
 ```
 > 如需自定义下载地址，可设置环境变量 `SCRIPT_URL=...` 再执行安装命令。
@@ -68,6 +64,42 @@ sudo gcpsc version         # 查看版本
 sudo gcpsc remove          # 卸载
 ```
 
+## Docker 运行（解决 Alpine 不兼容问题）
+> 镜像基于 `google/cloud-sdk:slim`（Debian），内置 gcloud 与 jq，避免 Alpine 上的 libc/gcloud 兼容问题。容器默认常驻（`tail -f /dev/null`），方便随时 `docker exec` 进入巡检/管理。
+
+### 构建镜像
+```bash
+docker build -t gcpsc .
+```
+
+### 启动常驻容器并挂载密钥
+```bash
+# /path/to/key.json 请替换为本地密钥绝对路径
+docker run -d --name gcpsc \
+  -v $PWD/gcpsc-data:/etc/gcpsc \        # 配置/密钥持久化
+  -v $PWD/gcpsc-log:/var/log \           # 日志持久化（可选）
+  -v /path/to/key.json:/keys/key.json:ro \
+  gcpsc
+```
+容器保持运行，后续直接 `docker exec` 进入。
+
+### 进入容器添加服务账号/交互菜单
+```bash
+docker exec -it gcpsc gcpsc          # 进入菜单
+# 菜单路径：账号管理 -> 添加服务账号 -> 输入 /keys/key.json
+```
+> 首次导入后，密钥会被复制到 `/etc/gcpsc/keys/`；复用同一 `gcpsc-data` 挂载目录时，可移除对原始 key.json 的绑定（或继续保持挂载以便更新）。
+
+### 无交互巡检（容器内执行）
+```bash
+docker exec gcpsc gcpsc check --no-refresh
+```
+> 如需调度，推荐在宿主机使用 cron/systemd timer 调用上述 `docker exec`。
+
+### 退出与清理
+- 停止容器：`docker stop gcpsc`
+- 删除容器（保留数据卷目录）：`docker rm gcpsc`
+
 ## 权限与依赖
 - GCP 角色：`roles/compute.instanceAdmin.v1`（或等价权限：list/get/start/reset + projects.list）。
 - 自动安装依赖：`gcloud`、`jq`、`cron`、`curl`（脚本会检测并安装）。
@@ -79,8 +111,15 @@ sudo gcpsc remove          # 卸载
 - **Cron 不运行**：检查 `crontab -l`、`systemctl status cron/crond`，查看 `/var/log/gcpsc.log`。
 - **实例启动失败**：检查配额、Spot 容量或换区尝试。
 
+## 版本记录
+- **v3.0.2**
+  - 修复安装回退下载逻辑，支持管道安装找不到自身脚本时自动下载。
+  - 保留实例监控开关与间隔；支持实例级检查间隔节流；监控开关生效。
+  - 菜单合并统计/日志，实例管理可设置间隔。
+- **v3.0.0**：服务账号支持、性能优化、日志改进。
+
 ## 许可证
 MIT
 
 ---
-如果对你有帮助，欢迎 Star ⭐ 支持。跑狗一步到位，Spot 实例不掉线。
+如果对你有帮助，欢迎 Star ⭐ 支持。跑狗一步到位，Spot 实例不掉线。***
